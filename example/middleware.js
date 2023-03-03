@@ -1,6 +1,11 @@
 import { NextResponse } from "next/server";
 
 export async function middleware(request) {
+  if (request.nextUrl.pathname === "/middleware-rewrite") {
+    const { nextUrl: url } = request
+    url.searchParams.set("rewritten", "true")
+    return NextResponse.rewrite(url);
+  }
   if (request.nextUrl.pathname === "/middleware-redirect") {
     return NextResponse.redirect(new URL("/middleware-redirect-destination", request.url));
   }
@@ -25,8 +30,28 @@ export async function middleware(request) {
     console.log(await fetch("https://webhook.site/facbcacc-08f2-4fb1-b67f-a26e3382b64e"));
     return NextResponse.next();
   }
+  if (request.nextUrl.pathname === "/middleware-geolocation") {
+    const { nextUrl: url, geo } = request
+    //console.log("== request", request);
+    //console.log("== geo", geo);
+    const country = geo.country || "US"
+    const city = geo.city || "San Francisco"
+    const region = geo.region || "CA"
+  
+    url.searchParams.set('country', country)
+    url.searchParams.set('city', city)
+    url.searchParams.set('region', region)
+  
+    return NextResponse.rewrite(url);
+  }
 }
 
 export const config = {
-  matcher: ["/middleware-redirect", "/middleware-set-header", "/middleware-fetch"],
+  matcher: [
+    "/middleware-rewrite",
+    "/middleware-redirect",
+    "/middleware-set-header",
+    "/middleware-fetch",
+    "/middleware-geolocation",
+  ],
 }
