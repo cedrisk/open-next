@@ -1,5 +1,12 @@
 # open-next
 
+## 3.0.1
+
+### Patch Changes
+
+- d5efc43: Fix next version check
+- c2817fe: Handle partial failure in ISR revalidation
+
 ## 3.0.0
 
 ### Major Changes
