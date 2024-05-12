@@ -26,13 +26,26 @@ export default function Home() {
           new timestamp
         </Nav>
         <Nav href={"/ssr"} title="SSR">
-          Server Side Render should generate a new timestamp on each load
+          Server Side Render should generate a new timestamp on each load.
+          Streaming support for loading...
         </Nav>
         <Nav href={"/api"} title="API">
           Calls an API endpoint defined in app/api/hello/route and middleware
         </Nav>
         <Nav href={"/parallel"} title="Parallel">
           Parallel routing
+        </Nav>
+        <Nav href={"/headers"} title="Headers">
+          Headers from middleware should be available via headers()
+        </Nav>
+        <Nav href={"/search-query"} title="Search Query">
+          Search Query Params should be available in middleware
+        </Nav>
+        <Nav href={"/sse"} title="Server Sent Events">
+          Server Sent Events via Streaming
+        </Nav>
+        <Nav href={"/image-optimization"} title="Image Optimization">
+          Image Optimization with next/image
         </Nav>
       </main>
     </>

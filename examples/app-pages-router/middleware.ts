@@ -7,9 +7,12 @@ export function middleware(request: NextRequest) {
   const protocol = host?.startsWith("localhost") ? "http" : "https";
   if (path === "/redirect") {
     const u = new URL("/redirect-destination", `${protocol}://${host}`);
-    return NextResponse.redirect(u);
+    return NextResponse.redirect(u, {
+      headers: { "set-cookie": "test=success" },
+    });
   } else if (path === "/rewrite") {
     const u = new URL("/rewrite-destination", `${protocol}://${host}`);
+    u.searchParams.set("a", "b");
     return NextResponse.rewrite(u);
   } else if (path === "/api/middleware") {
     return new NextResponse(JSON.stringify({ hello: "middleware" }), {

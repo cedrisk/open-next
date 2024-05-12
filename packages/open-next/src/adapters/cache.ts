@@ -1,23 +1,16 @@
-import path from "node:path";
-
-import {
-  DeleteObjectsCommand,
-  GetObjectCommand,
-  ListObjectsV2Command,
-  PutObjectCommand,
-  PutObjectCommandInput,
-  S3Client,
-} from "@aws-sdk/client-s3";
-
-import { awsLogger, debug, error } from "./logger.js";
-import { loadBuildId } from "./util.js";
+import { IncrementalCache } from "../cache/incremental/types.js";
+import { TagCache } from "../cache/tag/types.js";
+import { isBinaryContentType } from "./binary.js";
+import { debug, error, warn } from "./logger.js";
 
 interface CachedFetchValue {
   kind: "FETCH";
   data: {
     headers: { [k: string]: string };
     body: string;
+    url: string;
     status?: number;
+    tags?: string[];
   };
   revalidate: number;
 }
@@ -51,6 +44,8 @@ interface IncrementalCachedPageValue {
   // the string value
   html: string;
   pageData: Object;
+  status?: number;
+  headers?: Record<string, undefined | string>;
 }
 
 type IncrementalCacheValue =
@@ -59,6 +54,14 @@ type IncrementalCacheValue =
   | CachedImageValue
   | CachedFetchValue
   | CachedRouteValue;
+
+type IncrementalCacheContext = {
+  revalidate?: number | false | undefined;
+  fetchCache?: boolean | undefined;
+  fetchUrl?: string | undefined;
+  fetchIdx?: number | undefined;
+  tags?: string[] | undefined;
+};
 
 interface CacheHandlerContext {
   fs?: never;
@@ -78,44 +81,67 @@ interface CacheHandlerValue {
   value: IncrementalCacheValue | null;
 }
 
-type Extension =
-  | "json"
-  | "html"
-  | "rsc"
-  | "body"
-  | "meta"
-  | "fetch"
-  | "redirect";
+/** Beginning single backslash is intentional, to look for the dot + the extension. Do not escape it again. */
+const CACHE_EXTENSION_REGEX = /\.(cache|fetch)$/;
 
-// Expected environment variables
-const { CACHE_BUCKET_NAME, CACHE_BUCKET_KEY_PREFIX, CACHE_BUCKET_REGION } =
-  process.env;
+export function hasCacheExtension(key: string) {
+  return CACHE_EXTENSION_REGEX.test(key);
+}
 
+declare global {
+  var incrementalCache: IncrementalCache;
+  var tagCache: TagCache;
+  var disableDynamoDBCache: boolean;
+  var disableIncrementalCache: boolean;
+  var lastModified: Record<string, number>;
+}
+// We need to use globalThis client here as this class can be defined at load time in next 12 but client is not available at load time
 export default class S3Cache {
-  private client: S3Client;
-  private buildId: string;
+  constructor(_ctx: CacheHandlerContext) {}
 
-  constructor(_ctx: CacheHandlerContext) {
-    this.client = new S3Client({
-      region: CACHE_BUCKET_REGION,
-      logger: awsLogger,
-    });
-    this.buildId = loadBuildId(
-      path.dirname(_ctx.serverDistDir ?? ".next/server"),
-    );
-  }
-
-  async get(key: string, fetchCache?: boolean) {
-    return fetchCache ? this.getFetchCache(key) : this.getIncrementalCache(key);
+  public async get(
+    key: string,
+    // fetchCache is for next 13.5 and above, kindHint is for next 14 and above and boolean is for earlier versions
+    options?:
+      | boolean
+      | { fetchCache?: boolean; kindHint?: "app" | "pages" | "fetch" },
+  ) {
+    if (globalThis.disableIncrementalCache) {
+      return null;
+    }
+    const isFetchCache =
+      typeof options === "object"
+        ? options.kindHint
+          ? options.kindHint === "fetch"
+          : options.fetchCache
+        : options;
+    return isFetchCache
+      ? this.getFetchCache(key)
+      : this.getIncrementalCache(key);
   }
 
   async getFetchCache(key: string) {
     debug("get fetch cache", { key });
     try {
-      const { Body, LastModified } = await this.getS3Object(key, "fetch");
+      const { value, lastModified } = await globalThis.incrementalCache.get(
+        key,
+        true,
+      );
+      // const { Body, LastModified } = await this.getS3Object(key, "fetch");
+      const _lastModified = await globalThis.tagCache.getLastModified(
+        key,
+        lastModified,
+      );
+      if (_lastModified === -1) {
+        // If some tags are stale we need to force revalidation
+        return null;
+      }
+
+      if (value === undefined) return null;
+
       return {
-        lastModified: LastModified?.getTime(),
-        value: JSON.parse((await Body?.transformToString()) ?? "{}"),
+        lastModified: _lastModified,
+        value: value,
       } as CacheHandlerValue;
     } catch (e) {
       error("Failed to get fetch cache", e);
@@ -124,176 +150,170 @@ export default class S3Cache {
   }
 
   async getIncrementalCache(key: string): Promise<CacheHandlerValue | null> {
-    const keys = await this.listS3Object(key);
-    if (keys.length === 0) return null;
-    debug("keys", keys);
-
-    if (keys.includes(this.buildS3Key(key, "body"))) {
-      debug("get body cache ", { key });
-      try {
-        const [{ Body, LastModified }, { Body: MetaBody }] = await Promise.all([
-          this.getS3Object(key, "body"),
-          this.getS3Object(key, "meta"),
-        ]);
-        const body = await Body?.transformToByteArray();
-        const meta = JSON.parse((await MetaBody?.transformToString()) ?? "{}");
-
+    try {
+      const { value: cacheData, lastModified } =
+        await globalThis.incrementalCache.get(key, false);
+      // const { Body, LastModified } = await this.getS3Object(key, "cache");
+      // const cacheData = JSON.parse(
+      //   (await Body?.transformToString()) ?? "{}",
+      // ) as S3CachedFile;
+      const meta = cacheData?.meta;
+      const _lastModified = await globalThis.tagCache.getLastModified(
+        key,
+        lastModified,
+      );
+      if (_lastModified === -1) {
+        // If some tags are stale we need to force revalidation
+        return null;
+      }
+      const requestId = globalThis.__als.getStore() ?? "";
+      globalThis.lastModified[requestId] = _lastModified;
+      if (cacheData?.type === "route") {
         return {
-          lastModified: LastModified?.getTime(),
+          lastModified: _lastModified,
           value: {
             kind: "ROUTE",
-            body: Buffer.from(body ?? Buffer.alloc(0)),
-            status: meta.status,
-            headers: meta.headers,
+            body: Buffer.from(
+              cacheData.body ?? Buffer.alloc(0),
+              isBinaryContentType(String(meta?.headers?.["content-type"]))
+                ? "base64"
+                : "utf8",
+            ),
+            status: meta?.status,
+            headers: meta?.headers,
           },
         } as CacheHandlerValue;
-      } catch (e) {
-        error("Failed to get body cache", e);
-      }
-      return null;
-    }
-
-    if (keys.includes(this.buildS3Key(key, "html"))) {
-      const isJson = keys.includes(this.buildS3Key(key, "json"));
-      const isRsc = keys.includes(this.buildS3Key(key, "rsc"));
-      debug("get html cache ", { key, isJson, isRsc });
-      if (!isJson && !isRsc) return null;
-
-      try {
-        const [{ Body, LastModified }, { Body: PageBody }] = await Promise.all([
-          this.getS3Object(key, "html"),
-          this.getS3Object(key, isJson ? "json" : "rsc"),
-        ]);
-
+      } else if (cacheData?.type === "page" || cacheData?.type === "app") {
         return {
-          lastModified: LastModified?.getTime(),
+          lastModified: _lastModified,
           value: {
             kind: "PAGE",
-            html: (await Body?.transformToString()) ?? "",
-            pageData: isJson
-              ? JSON.parse((await PageBody?.transformToString()) ?? "{}")
-              : await PageBody?.transformToString(),
+            html: cacheData.html,
+            pageData:
+              cacheData.type === "page" ? cacheData.json : cacheData.rsc,
+            status: meta?.status,
+            headers: meta?.headers,
           },
         } as CacheHandlerValue;
-      } catch (e) {
-        error("Failed to get html cache", e);
-      }
-      return null;
-    }
-
-    // Check for redirect last. This way if a page has been regenerated
-    // after having been redirected, we'll get the page data
-    if (keys.includes(this.buildS3Key(key, "redirect"))) {
-      debug("get redirect cache", { key });
-      try {
-        const { Body, LastModified } = await this.getS3Object(key, "redirect");
+      } else if (cacheData?.type === "redirect") {
         return {
-          lastModified: LastModified?.getTime(),
-          value: JSON.parse((await Body?.transformToString()) ?? "{}"),
-        };
-      } catch (e) {
-        error("Failed to get redirect cache", e);
+          lastModified: _lastModified,
+          value: {
+            kind: "REDIRECT",
+            props: cacheData.props,
+          },
+        } as CacheHandlerValue;
+      } else {
+        warn("Unknown cache type", cacheData);
+        return null;
       }
+    } catch (e) {
+      error("Failed to get body cache", e);
       return null;
     }
-
-    return null;
   }
 
-  async set(key: string, data?: IncrementalCacheValue | null): Promise<void> {
+  async set(
+    key: string,
+    data?: IncrementalCacheValue,
+    ctx?: IncrementalCacheContext,
+  ): Promise<void> {
+    if (globalThis.disableIncrementalCache) {
+      return;
+    }
     if (data?.kind === "ROUTE") {
       const { body, status, headers } = data;
-      await Promise.all([
-        this.putS3Object(key, "body", body),
-        this.putS3Object(key, "meta", JSON.stringify({ status, headers })),
-      ]);
+      await globalThis.incrementalCache.set(
+        key,
+        {
+          type: "route",
+          body: body.toString(
+            isBinaryContentType(String(headers["content-type"]))
+              ? "base64"
+              : "utf8",
+          ),
+          meta: {
+            status,
+            headers,
+          },
+        },
+        false,
+      );
     } else if (data?.kind === "PAGE") {
       const { html, pageData } = data;
       const isAppPath = typeof pageData === "string";
-      await Promise.all([
-        this.putS3Object(key, "html", html),
-        this.putS3Object(
+      if (isAppPath) {
+        globalThis.incrementalCache.set(
           key,
-          isAppPath ? "rsc" : "json",
-          isAppPath ? pageData : JSON.stringify(pageData),
-        ),
-      ]);
-    } else if (data?.kind === "FETCH") {
-      await this.putS3Object(key, "fetch", JSON.stringify(data));
-    } else if (data?.kind === "REDIRECT") {
-      // delete potential page data if we're redirecting
-      await this.deleteS3Objects(key);
-      await this.putS3Object(key, "redirect", JSON.stringify(data));
-    } else if (data === null || data === undefined) {
-      await this.deleteS3Objects(key);
-    }
-  }
-
-  private buildS3Key(key: string, extension: Extension) {
-    return path.posix.join(
-      CACHE_BUCKET_KEY_PREFIX ?? "",
-      extension === "fetch" ? "__fetch" : "",
-      this.buildId,
-      extension === "fetch" ? key : `${key}.${extension}`,
-    );
-  }
-
-  private buildS3KeyPrefix(key: string) {
-    return path.posix.join(CACHE_BUCKET_KEY_PREFIX ?? "", this.buildId, key);
-  }
-
-  private async listS3Object(key: string) {
-    const { Contents } = await this.client.send(
-      new ListObjectsV2Command({
-        Bucket: CACHE_BUCKET_NAME,
-        // add a point to the key so that it only matches the key and
-        // not other keys starting with the same string
-        Prefix: `${this.buildS3KeyPrefix(key)}.`,
-      }),
-    );
-    return (Contents ?? []).map(({ Key }) => Key);
-  }
-
-  private getS3Object(key: string, extension: Extension) {
-    return this.client.send(
-      new GetObjectCommand({
-        Bucket: CACHE_BUCKET_NAME,
-        Key: this.buildS3Key(key, extension),
-      }),
-    );
-  }
-
-  private putS3Object(
-    key: string,
-    extension: Extension,
-    value: PutObjectCommandInput["Body"],
-  ) {
-    return this.client.send(
-      new PutObjectCommand({
-        Bucket: CACHE_BUCKET_NAME,
-        Key: this.buildS3Key(key, extension),
-        Body: value,
-      }),
-    );
-  }
-
-  private async deleteS3Objects(key: string) {
-    try {
-      const regex = new RegExp(`\.(json|rsc|html|body|meta|fetch|redirect)$`);
-      const s3Keys = (await this.listS3Object(key)).filter(
-        (key) => key && regex.test(key),
-      );
-
-      await this.client.send(
-        new DeleteObjectsCommand({
-          Bucket: CACHE_BUCKET_NAME,
-          Delete: {
-            Objects: s3Keys.map((Key) => ({ Key })),
+          {
+            type: "app",
+            html,
+            rsc: pageData,
           },
-        }),
+          false,
+        );
+      } else {
+        globalThis.incrementalCache.set(
+          key,
+          {
+            type: "page",
+            html,
+            json: pageData,
+          },
+          false,
+        );
+      }
+    } else if (data?.kind === "FETCH") {
+      await globalThis.incrementalCache.set<true>(key, data, true);
+    } else if (data?.kind === "REDIRECT") {
+      await globalThis.incrementalCache.set(
+        key,
+        {
+          type: "redirect",
+          props: data.props,
+        },
+        false,
       );
-    } catch (e) {
-      error("Failed to delete cache", e);
+    } else if (data === null || data === undefined) {
+      await globalThis.incrementalCache.delete(key);
     }
+    // Write derivedTags to dynamodb
+    // If we use an in house version of getDerivedTags in build we should use it here instead of next's one
+    const derivedTags: string[] =
+      data?.kind === "FETCH"
+        ? ctx?.tags ?? data?.data?.tags ?? [] // before version 14 next.js used data?.data?.tags so we keep it for backward compatibility
+        : data?.kind === "PAGE"
+        ? data.headers?.["x-next-cache-tags"]?.split(",") ?? []
+        : [];
+    debug("derivedTags", derivedTags);
+    // Get all tags stored in dynamodb for the given key
+    // If any of the derived tags are not stored in dynamodb for the given key, write them
+    const storedTags = await globalThis.tagCache.getByPath(key);
+    const tagsToWrite = derivedTags.filter((tag) => !storedTags.includes(tag));
+    if (tagsToWrite.length > 0) {
+      await globalThis.tagCache.writeTags(
+        tagsToWrite.map((tag) => ({
+          path: key,
+          tag: tag,
+        })),
+      );
+    }
+  }
+
+  public async revalidateTag(tag: string) {
+    if (globalThis.disableDynamoDBCache || globalThis.disableIncrementalCache) {
+      return;
+    }
+    debug("revalidateTag", tag);
+    // Find all keys with the given tag
+    const paths = await globalThis.tagCache.getByTag(tag);
+    debug("Items", paths);
+    // Update all keys with the given tag with revalidatedAt set to now
+    await globalThis.tagCache.writeTags(
+      paths?.map((path) => ({
+        path: path,
+        tag: tag,
+      })) ?? [],
+    );
   }
 }

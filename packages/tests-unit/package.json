@@ -1,8 +1,6 @@
 {
   "name": "tests-unit",
-  "version": "0.0.0",
   "private": true,
-  "type": "module",
   "scripts": {
     "clean": "rm -rf .turbo && rm -rf node_modules",
     "dev": "vitest",
@@ -18,5 +16,6 @@
     "jsdom": "^22.1.0",
     "vitest": "^0.34.1",
     "vite": "4.4.9"
-  }
+  },
+  "version": null
 }
